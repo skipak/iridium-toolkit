@@ -20,7 +20,7 @@ def rs_check(data):
 def rs_fix(data):
 #	data=data+bytearray([0]*elen)
 	data=data+([0]*elen)
-	r=range(len(data)-elen,len(data))
+	r=list(range(len(data)-elen,len(data)))
 	try:
 		(cmsg,crs)=reedsolo6.rs_correct_msg(data,nsym,fcr,generator,r)
 	except reedsolo6.ReedSolomonError:

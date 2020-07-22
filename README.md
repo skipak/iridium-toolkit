@@ -1,5 +1,11 @@
 # Simple toolkit to decode Iridium signals
 
+## NOTE: This is the python3 branch.
+
+#### iridium-parser is currently ~15% slower when run in python3 pypy over python2 pypy
+
+Depending on your time and resources, you may want to stay with python2 for now.
+
 ### Requisites
 
  * Python (2.7)
