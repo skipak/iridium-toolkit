@@ -10,6 +10,7 @@ Depending on your time and resources, you may want to stay with python2 for now.
 
  * Python (2.7)
  * NumPy (scipy)
+ * crcmod
 
 ### License
 

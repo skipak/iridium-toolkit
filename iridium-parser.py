@@ -6,7 +6,7 @@ import sys
 import re
 import struct
 from bch import ndivide, nrepair, bch_repair
-from crc import crc24
+import crcmod
 import rs
 import rs6
 import fileinput
@@ -21,6 +21,7 @@ from math import sqrt,atan2,pi
 options, remainder = getopt.getopt(sys.argv[1:], 'vgi:o:pes', [
                                                          'verbose',
                                                          'good',
+                                                         'uw-ec',
                                                          'harder',
                                                          'confidence=',
                                                          'input=',
@@ -36,6 +37,8 @@ options, remainder = getopt.getopt(sys.argv[1:], 'vgi:o:pes', [
                                                          'errorfile=',
                                                          'errorstats',
                                                          'forcetype=',
+                                                         'globaltime',
+                                                         'channelize',
                                                          ])
 
 iridium_access="001100000011000011110011" # Actually 0x789h in BPSK
@@ -44,16 +47,20 @@ UW_DOWNLINK = [0,2,2,2,2,0,0,0,2,0,0,2]
 UW_UPLINK   = [2,2,0,0,0,2,0,0,2,0,2,2]
 iridium_lead_out="100101111010110110110011001111"
 header_messaging="00110011111100110011001111110011" # 0x9669 in BPSK
+header_time_location="11"+"0"*94
 messaging_bch_poly=1897
 ringalert_bch_poly=1207
 acch_bch_poly=3545 # 1207 also works?
-hdr_poly=29
+hdr_poly=29 # IBC header
+base_freq=1616e6
+channel_width=41667
 
 verbose = False
 perfect = False
 errorfree = False
 interesting = False
 good = False
+uwec = False
 harder = False
 dosatclass = False
 input= "raw"
@@ -65,6 +72,8 @@ vdumpfile=None
 errorfile=None
 errorstats=None
 forcetype=None
+globaltime=False
+channelize=False
 
 for opt, arg in options:
     if opt in ('-v', '--verbose'):
@@ -72,6 +81,8 @@ for opt, arg in options:
     elif opt in ('-g','--good'):
         good = True
         min_confidence=90
+    elif opt in ('--uw-ec'):
+        uwec = True
     elif opt in ('--harder'):
         harder = True
     elif opt in ('--confidence'):
@@ -105,8 +116,12 @@ for opt, arg in options:
         errorstats={}
     elif opt in ('--forcetype'):
         forcetype=arg
+    elif opt in ('--channelize'):
+        channelize=True
     elif opt in ('--format'):
         ofmt=arg.split(',');
+    elif opt in ('--globaltime'):
+        globaltime=True;
     else:
         raise Exception("unknown argument?")
 
@@ -139,6 +154,16 @@ Z=Zulu()
 tswarning=False
 tsoffset=0
 maxts=0
+
+def fmt_iritime(iritime):
+    # Different Iridium epochs that we know about:
+    # 2014-05-11T14:23:55Z : 1399818235 current one
+    # 2007-03-08T03:50:21Z : 1173325821
+    # 1996-06-01T00:00:11Z :  833587211 the original one
+    uxtime= float(iritime)*90/1000+1399818235
+    strtime=datetime.datetime.fromtimestamp(uxtime,tz=Z).strftime("%Y-%m-%dT%H:%M:%S.{:02.0f}Z".format((uxtime%1)*100))
+    return (uxtime, strtime)
+
 class Message(object):
     def __init__(self,line):
         self.parse_error=False
@@ -159,6 +184,15 @@ class Message(object):
             self.filename="-";
         self.timestamp=float(m.group(3))
         self.frequency=int(m.group(4))
+
+        if channelize:
+            fbase=self.frequency-base_freq
+            self.fchan=int(fbase/channel_width)
+            self.foff=fbase%channel_width
+            self.freq_print="%3d|%05d"%(self.fchan,self.foff)
+        else:
+            self.freq_print="%010d"%(self.frequency)
+
 #        self.access_ok=(m.group(5)=="OK")
 #        self.leadout_ok=(m.group(6)=="OK")
         self.confidence=int(m.group(7))
@@ -210,7 +244,7 @@ class Message(object):
         elif(self.bitstream_raw.startswith(uplink_access)):
             self.uplink=1
         else:
-            if harder:
+            if uwec:
                 access=[]
                 map=[0,1,3,2]
                 # back into bpsk symbols
@@ -222,8 +256,10 @@ class Message(object):
 
                 if bitdiff(access,UW_DOWNLINK) <4:
                     self.uplink=0
+                    self.ec_uw=bitdiff(access,UW_DOWNLINK)
                 elif bitdiff(access,UW_UPLINK) <4:
                     self.uplink=1
+                    self.ec_uw=bitdiff(access,UW_UPLINK)
                 else:
                     self._new_error("Access code distance too big: %d/%d "%(bitdiff(access,UW_DOWNLINK),bitdiff(access,UW_UPLINK)))
             if("uplink" not in self.__dict__):
@@ -240,7 +276,29 @@ class Message(object):
         if not self.error_msg or self.error_msg[-1] != msg:
             self.error_msg.append(msg)
     def _pretty_header(self):
-        return "%s %013.3f %010d %3d%% %7.3f"%(self.filename,self.timestamp,self.frequency,self.confidence,self.level)
+        flags=""
+        if uwec:
+            if("ec_uw" in self.__dict__):
+                flags+="-UW:%d"%self.ec_uw
+            else:
+                flags+="-UW:0"
+
+        if harder:
+            if("ec_lcw" in self.__dict__):
+                flags+="-LCW:%s"%self.ec_lcw
+            else:
+                flags+="-LCW:0"
+
+        if not perfect:
+            if("fixederrs" in self.__dict__ and self.fixederrs>0):
+                flags+="-FIX:%d"%self.fixederrs
+            else:
+                flags+="-FIX:0"
+        if globaltime:
+            hdr="j%s %16.6f"%(flags,self.globaltime)
+        else:
+            hdr="%s %013.3f"%(self.filename,self.timestamp)
+        return "%s %s %3d%% %7.3f"%(hdr,self.freq_print,self.confidence,self.level)
     def _pretty_trailer(self):
         return ""
     def pretty(self):
@@ -280,7 +338,7 @@ class IridiumMessage(Message):
             return
 
         if "msgtype" not in self.__dict__:
-            if data[:2] =="11" and data[2:96]=="0"*94:
+            if data[:96]==header_time_location:
                 self.msgtype="TL"
 
         if "msgtype" not in self.__dict__ and linefilter['type'] == "IridiumSTLMessage":
@@ -303,24 +361,14 @@ class IridiumMessage(Message):
 
         if "msgtype" not in self.__dict__:
             if len(data)>64: # XXX: heuristic based on LCW / first BCH block, can we do better?
-                if harder:
-                    (o_lcw1,o_lcw2,o_lcw3)=de_interleave_lcw(data[:46])
-                    (e1 ,lcw1,bch)=bch_repair( 29,o_lcw1)
-                    (e2a,lcw2,bch)=bch_repair(465,o_lcw3+'0')
-                    (e2b,lcw2,bch)=bch_repair(465,o_lcw3+'1')
-                    (e3 ,lcw3,bch)=bch_repair( 41,o_lcw2)
-
-                    if e1>=0 and (e2a>=0 or e2b>=0) and e3>=0:
-                        self.msgtype="DA"
-                else:
-                    (o_lcw1,o_lcw2,o_lcw3)=de_interleave_lcw(data[:46])
-                    if ndivide( 29,o_lcw1)==0:
-                        if ndivide( 41,o_lcw3)==0:
-                            (e2,lcw2,bch)= bch_repair(465,o_lcw2+'0')  # One bit missing, so we guess
-                            if (e2==1): # Maybe the other one...
-                                (e2,lcw2,bch)= bch_repair(465,o_lcw2+'1')
-                            if e2==0:
-                                self.msgtype="DA"
+                (o_lcw1,o_lcw2,o_lcw3)=de_interleave_lcw(data[:46])
+                if ndivide( 29,o_lcw1)==0:
+                    if ndivide( 41,o_lcw3)==0:
+                        (e2,lcw2,bch)= bch_repair(465,o_lcw2+'0')  # One bit missing, so we guess
+                        if (e2==1): # Maybe the other one...
+                            (e2,lcw2,bch)= bch_repair(465,o_lcw2+'1')
+                        if e2==0:
+                            self.msgtype="DA"
 
         if "msgtype" not in self.__dict__ and linefilter['type'] == "IridiumDAMessage":
             self._new_error("filtered message")
@@ -338,6 +386,24 @@ class IridiumMessage(Message):
         if "msgtype" not in self.__dict__ and linefilter['type'] == "IridiumRAMessage":
             self._new_error("filtered message")
             return
+
+        if "msgtype" not in self.__dict__:
+            if harder:
+                # try for LCW (IDA)
+                if len(data)>=64:
+                    (o_lcw1,o_lcw2,o_lcw3)=de_interleave_lcw(data[:46])
+                    (e1 ,lcw1,bch)=bch_repair( 29,o_lcw1)     # BCH(7,3)
+                    (e2a,lcw2,bch)=bch_repair(465,o_lcw2+'0') # BCH(13,16)
+                    (e2b,lcw2,bch)=bch_repair(465,o_lcw2+'1')
+                    (e3 ,lcw3,bch)=bch_repair( 41,o_lcw3)     # BCH(26,21)
+
+                    e2=e2a
+                    if (e2b>=0 and e2b<e2a) or (e2a<0):
+                        e2=e2b
+
+                    if e1>=0 and e2>=0 and e3>=0:
+                        self.msgtype="DA"
+                        self.ec_lcw=(e1+e2+e3)
 
         if "msgtype" not in self.__dict__:
             if len(data)<64:
@@ -498,6 +564,8 @@ class IridiumMessage(Message):
                 self.msgtype="IP"
                 for x in slice(data[:312],8):
                     self.descrambled+=[x[::-1]]
+                    self.payload_f+=[int(x,2)]
+                    self.payload_r+=[int(x[::-1],2)]
                 self.descramble_extra=data[312:]
             elif self.ft==2: # DAta (SBD) - Mission control data - ISU/SV
                 self.descramble_extra=data[124*2+64:]
@@ -682,16 +750,10 @@ class IridiumLCW3Message(IridiumMessage):
 class IridiumVOMessage(IridiumMessage):
     def __init__(self,imsg):
         self.__dict__=imsg.__dict__
-        self.crcval=crc24(bytearray(self.payload_r))
+        self.crcval=iip_crc24( [chr(x) for x in self.payload_r])
         if self.crcval==0:
             self.vtype="VDA"
-            self.crc=struct.unpack(">L",bytearray([0]+self.payload_r[-3:]))
-            self.vdata=self.payload_r[5:-3]
-            self.vstype=self.payload_r[0]
-            self.vctr1=self.payload_r[1]
-            self.vuk1 =self.payload_r[2]
-            self.vctr2=self.payload_r[3]
-            self.vlen =self.payload_r[4]
+            return
         else:
             (ok,msg,csum)=rs6.rs_fix(self.payload_6)
             self.rs6p=False
@@ -713,6 +775,10 @@ class IridiumVOMessage(IridiumMessage):
                 self.vdata=self.payload_f
 
     def upgrade(self):
+        if self.vtype=="VDA":
+            new= IridiumIPMessage(self).upgrade()
+            new.itype="VDA"
+            return new
         return self
     def _pretty_header(self):
         return super(IridiumVOMessage,self)._pretty_header()
@@ -754,10 +820,11 @@ class IridiumVOMessage(IridiumMessage):
         str+=self._pretty_trailer()
         return str
 
+# Poly from GSM 04.64 / check value (reversed) is 0xC91B6
+iip_crc24=crcmod.mkCrcFun(poly=0x1BBA1B5,initCrc=0xffffff^0x0c91b6,rev=True,xorOut=0x0c91b6)
 class IridiumIPMessage(IridiumMessage):
     def __init__(self,imsg):
         self.__dict__=imsg.__dict__
-        self.payload_f=[int(x[::-1],2) for x in self.descrambled]
         (ok,msg,rsc)=rs.rs_fix(self.payload_f)
         if ok:
             self.itype="IIQ"
@@ -782,28 +849,28 @@ class IridiumIPMessage(IridiumMessage):
                self.itype="IIR"
                self.idata=self.idata[0:-2]
         else:
-            self.crcval=crc24(bytearray([int(x,2) for x in self.descrambled]))
+            self.crcval=iip_crc24( [chr(x) for x in self.payload_r])
             if self.crcval==0:
                 self.itype="IIP"
-                self.ip_hdr=int(self.descrambled[0],2)
+                self.ip_hdr=self.payload_r[0]
                             #  106099 01: ACK / IDLE
                             #  458499 04: Data
                             #    2476 0b:
                             #     504 0f:
                             #     173 14:
                             #    1477 11:
-                self.ip_seq=int(self.descrambled[1],2)
-                self.ip_ack=int(self.descrambled[2],2)
-                self.ip_cs= int(self.descrambled[3],2)
+                self.ip_seq=self.payload_r[1]
+                self.ip_ack=self.payload_r[2]
+                self.ip_cs= self.payload_r[3]
                 self.ip_cs_ok=self.ip_hdr+self.ip_seq+self.ip_ack+self.ip_cs
                 while (self.ip_cs_ok>255):
                     self.ip_cs_ok-=255
-                self.ip_len= int(self.descrambled[4],2)
+                self.ip_len= self.payload_r[4]
                 if self.ip_len>31:
                     #self._new_error("Invalid ip_len")
                     pass
-                self.ip_data=[int(x,2) for x in self.descrambled[5:31+5]] # XXX: only len bytes?
-                self.ip_cksum= self.descrambled[31+5:]
+                self.ip_data=self.payload_r[5:31+5] # XXX: only len bytes?
+                self.ip_cksum= struct.unpack(">L", bytearray([0]+self.payload_r[31+5:]))[0]
             else:
                 self.itype="IIU"
     def upgrade(self):
@@ -814,10 +881,10 @@ class IridiumIPMessage(IridiumMessage):
         return super(IridiumIPMessage,self)._pretty_trailer()
     def pretty(self):
         s= self.itype+": "+self._pretty_header()
-        if self.itype=="IIP":
+        if self.itype=="IIP" or self.itype=="VDA":
             s+= " type:%02x seq=%03d ack=%03d cs=%03d/%s len=%03d"%(self.ip_hdr,self.ip_seq,self.ip_ack,self.ip_cs,["no","OK"][(self.ip_cs_ok==255)],self.ip_len)
             s+= " ["+".".join(["%02x"%x for x in self.ip_data])+"]"
-            s+= " %06x/%06x"%(int("".join(self.ip_cksum),2),self.crcval)
+            s+= " %06x/%06x"%(self.ip_cksum,self.crcval)
             s+=" FCS:OK"
             ip_data = ' IP: '
             for c in self.ip_data:
@@ -920,6 +987,7 @@ class IridiumECCMessage(IridiumMessage):
         str+=self._pretty_trailer()
         return str
 
+ida_crc16=crcmod.predefined.mkPredefinedCrcFun("crc-ccitt-false")
 class IridiumDAMessage(IridiumECCMessage):
     def __init__(self,imsg):
         self.__dict__=imsg.__dict__
@@ -927,32 +995,21 @@ class IridiumDAMessage(IridiumECCMessage):
         self.flags1=self.bitstream_bch[:4]
         self.flag1b=self.bitstream_bch[4:5]
         self.da_ctr=int(self.bitstream_bch[5:8],2)
-        self.flags2=self.bitstream_bch[8:12]
-        self.flags3=self.bitstream_bch[12:16]
-        self.zero1=int(self.bitstream_bch[16:20],2)
+        self.flags2=self.bitstream_bch[8:11]
+        self.da_len=int(self.bitstream_bch[11:16],2)
+        self.flags3=int(self.bitstream_bch[16:17],2)
+        self.zero1=int(self.bitstream_bch[17:20],2)
         if self.zero1 != 0:
             self._new_error("zero1 not 0")
-
-        def crc16(data): # 0x1021 / 0xffff unreflected
-            crc = 0xffff
-            for byte in data:
-                crc=crc^ord(byte)
-                for bit in range(0, 8):
-                    if (crc&0x1):
-                        crc = ((crc >> 1) ^ 0x8408)
-                    else:
-                        crc = crc >> 1
-            return crc ^ 0xdf9d
 
         if len(self.bitstream_bch) < 9*20+16:
             raise ParserError("Not enough data in data packet")
 
-        self.da_len=int(self.bitstream_bch[11:16],2)
         if self.da_len>0:
             self.da_crc=int(self.bitstream_bch[9*20:9*20+16],2)
             self.da_ta=[int(x,2) for x in slice(self.bitstream_bch[20:9*20],8)]
-            crcstream=self.bitstream_bch[:16]+"0"*12+self.bitstream_bch[16:]
-            the_crc=crc16("".join([chr(int(x,2)) for x in crcstream]))
+            crcstream=self.bitstream_bch[:20]+"0"*12+self.bitstream_bch[20:-4]
+            the_crc=ida_crc16([chr(int(x,2)) for x in slice(crcstream,8)])
             self.the_crc=the_crc
             self.crc_ok=(the_crc==0)
         else:
@@ -1030,79 +1087,68 @@ class IridiumDAMessage(IridiumECCMessage):
 class IridiumBCMessage(IridiumECCMessage):
     def __init__(self,imsg):
         self.__dict__=imsg.__dict__
-        blocks, _ =slice_extra(self.bitstream_bch,21)
+        blocks, _ =slice_extra(self.bitstream_bch,42)
 
         self.readable = ''
-        if len(blocks) > 1 and self.bc_type == 0:
-            data1 = blocks[0]
-            data2 = blocks[1]
+        if blocks and self.bc_type == 0:
+            data = blocks.pop(0)
 
-            self.sv_id = int(data1[0:7], 2)
-            self.beam_id = int(data1[7:13], 2)
-            self.unknown01 = data1[13:14]
-            self.slot = int(data1[14:15], 2) # previously: timeslot
-            self.sv_blocking = int(data1[15:16], 2) # aka: Acq
-            self.acqu_classes = data1[16:21] + data2[0:11]
-            self.acqu_subband = int(data2[11:16], 2)
-            self.acqu_channels = int(data2[16:19], 2)
-            self.unknown02 = data2[19:21]
+            self.sv_id = int(data[0:7], 2)
+            self.beam_id = int(data[7:13], 2)
+            self.unknown01 = data[13:14]
+            self.slot = int(data[14:15], 2) # previously: timeslot
+            self.sv_blocking = int(data[15:16], 2) # aka: Acq
+            self.acqu_classes = data[16:32]
+            self.acqu_subband = int(data[32:37], 2)
+            self.acqu_channels = int(data[37:40], 2)
+            self.unknown02 = data[40:42]
 
             self.readable += 'sat:%03d cell:%02d %s slot:%d sv_blkn:%d aq_cl:%s aq_sb:%02d aq_ch:%d %s' % (self.sv_id, self.beam_id, self.unknown01, self.slot, self.sv_blocking, self.acqu_classes, self.acqu_subband, self.acqu_channels, self.unknown02)
 
-            blocks = blocks[2:]
+        if blocks and self.bc_type == 0:
+            data = blocks.pop(0)
 
-        if len(blocks) > 1 and self.bc_type == 0:
-            data1 = blocks[0]
-            data2 = blocks[1]
-
-            self.type = int(data1[0:6], 2)
+            self.type = int(data[0:6], 2)
             if self.type == 0:
-                self.unknown11 = data1[6:21] + data2[0:15]
-                self.max_uplink_pwr = int(data2[15:21], 2)
+                self.unknown11 = data[6:36]
+                self.max_uplink_pwr = int(data[36:42], 2)
                 self.readable += ' %s max_uplink_pwr:%02d' % (self.unknown11, self.max_uplink_pwr)
             elif self.type == 1:
-                self.unknown21 = data1[6:10]
-                self.iri_time = int(data1[10:21]+data2[0:21], 2)
-                # Different Iridium epochs that we know about:
-                # 2014-05-11T14:23:55Z : 1399818235 current one
-                # 2007-03-08T03:50:21Z : 1173325821
-                # 1996-06-01T00:00:11Z :  833587211 the original one
-                self.iri_time_ux = float(self.iri_time)*90/1000+1399818235
+                self.unknown21 = data[6:10]
+                self.iri_time = int(data[10:42], 2)
+                (self.iri_time_ux, self.iri_time_str)= fmt_iritime(self.iri_time)
                 self.iri_time_diff = self.iri_time_ux-self.globaltime
-                self.readable += ' %s time:%sZ' % (self.unknown21, datetime.datetime.fromtimestamp(self.iri_time_ux,tz=Z).strftime("%Y-%m-%dT%H:%M:%S.{:02.0f}".format((self.iri_time_ux%1)*100)))
+                self.readable += ' %s time:%s' % (self.unknown21, self.iri_time_str)
             elif self.type == 2:
-                self.unknown31 = data1[6:10]
-                self.tmsi_expiry = int(data1[10:21] + data2[0:21], 2)
-                self.readable += ' %s tmsi_expiry:%02d' % (self.unknown31, self.tmsi_expiry)
+                self.unknown31 = data[6:10]
+                self.tmsi_expiry = int(data[10:43], 2)
+                (self.tmsi_expiry_ux, tmsi_expiry_str)= fmt_iritime(self.tmsi_expiry)
+                self.readable += ' %s tmsi_expiry:%s' % (self.unknown31, tmsi_expiry_str)
             elif self.type == 4:
-                if data1+data2 != "000100000000100001110000110000110011110000":
-                    self.readable += ' type:%02d %s%s' % (self.type, data1, data2)
+                if data != "000100000000100001110000110000110011110000":
+                    self.readable += ' type:%02d %s' % (self.type, data)
             else: # Unknown Type
-                self.readable += ' type:%02d %s%s' % (self.type, data1, data2)
+                self.readable += ' type:%02d %s' % (self.type, data)
 #                raise ParserError("unknown BC Type %s"%self.type)
-            blocks = blocks[2:]
 
-        def parse_assignment(data1, data2):
+        def parse_assignment(data):
             result = ''
-            if(data1 + data2 != '111000000000000000000000000000000000000000'):
+            if(data != '111000000000000000000000000000000000000000'):
                 # Channel Assignment
-                unknown1 = data1[0:3]
-                random_id = int(data1[3:11], 2)
-                timeslot = 1+int(data1[11:13], 2)
-                uplink_subband = int(data1[13:18], 2)
-                downlink_subband = int(data1[18:21] + data2[0:2], 2)
-                access = 1+int(data2[2:5], 2)
-                dtoa = int(data2[5:13], 2)
-                dfoa = int(data2[13:19], 2)
-                unknown4 = data2[19:21]
+                unknown1 = data[0:3]
+                random_id = int(data[3:11], 2)
+                timeslot = 1+int(data[11:13], 2)
+                uplink_subband = int(data[13:18], 2)
+                downlink_subband = int(data[18:23], 2)
+                access = 1+int(data[23:26], 2)
+                dtoa = int(data[26:34], 2)
+                dfoa = int(data[34:40], 2)
+                unknown4 = data[40:42]
                 result = ' %s Rid:%d ts:%d ul_sb:%02d dl_sb:%02d access:%d dtoa:%03d dfoa:%02d %s' % (unknown1, random_id, timeslot, uplink_subband, downlink_subband, access, dtoa, dfoa, unknown4)
             return result
 
-        while len(blocks) > 1:
-            data1 = blocks[0]
-            data2 = blocks[1]
-            self.readable += parse_assignment(data1, data2)
-            blocks = blocks[2:]
+        while blocks:
+            self.readable += parse_assignment(blocks.pop(0))
 
     def upgrade(self):
         if self.error: return self

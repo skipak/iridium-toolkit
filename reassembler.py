@@ -9,14 +9,18 @@ import re
 import struct
 import math
 import os
+import socket
 
 verbose = False
 ifile= None
 ofile= None
 mode= "undef"
+base_freq=1616e6
+channel_width=41667
 
-options, remainder = getopt.getopt(sys.argv[1:], 'vi:o:m:', [
+options, remainder = getopt.getopt(sys.argv[1:], 'vhi:o:m:', [
                                                          'verbose',
+                                                         'help',
                                                          'input=',
                                                          'output=',
                                                          'mode=',
@@ -31,6 +35,10 @@ for opt, arg in options:
         ofile=arg
     elif opt in ('-m', '--mode'):
         mode=arg
+    elif opt in ('-h', '--help'):
+        print >> sys.stderr, "Usage:"
+        print >> sys.stderr, "\t",os.path.basename(sys.argv[0]),"[-v] [--input foo.parsed] --mode [ida|lap|page|msg|sat] [--output foo.parsed]"
+        exit(1)
     else:
         raise Exception("unknown argument?")
 
@@ -62,9 +70,11 @@ if verbose:
     print "basen",basename
 
 def fixtime(n,t):
+    if (n.startswith("j")):
+        return float(t)
     try:
         (crap,ts,fnord)=n.split("-",3)
-        return (float(ts)+int(t)/1000)
+        return (float(ts)+float(t)/1000)
     except:
         return float(t)/1000
 
@@ -91,7 +101,12 @@ class Reassemble(object):
         try:
             q=MyObject()
             q.typ,q.name,q.time,q.frequency,q.confidence,q.level,q.symbols,q.uldl,q.data=line.split(None,8)
-            q.frequency=int(q.frequency)
+            if "|" in q.frequency:
+                chan, off=q.frequency.split('|')
+                q.frequency=base_freq+channel_width*int(chan)+int(off)
+            else:
+                q.frequency=int(q.frequency)
+            q.confidence=int(q.confidence.strip("%"))
             q.time=float(q.time)
             q.level=float(q.level)
             return q
@@ -102,6 +117,56 @@ class Reassemble(object):
     def end(self):
         print "Kept %d/%d (%3.1f%%) lines"%(self.stat_filter,self.stat_line,100.0*self.stat_filter/self.stat_line)
 
+class ReassemblePPM(Reassemble):
+    qqq=None
+    def __init__(self):
+        pass
+
+    r1=re.compile('.* slot:(\d)')
+    r2=re.compile('.* time:([0-9:T-]+(\.\d+)?)Z')
+
+    def filter(self,line):
+        q=super(ReassemblePPM,self).filter(line)
+        if q==None: return None
+        if q.typ!="IBC:": return None
+        if q.confidence<95: return None
+
+
+        m=self.r1.match(q.data)
+        if not m: return
+        q.slot=int(m.group(1))
+
+        m=self.r2.match(q.data)
+        if not m: return
+        if m.group(2):
+            q.itime = datetime.datetime.strptime(m.group(1), '%Y-%m-%dT%H:%M:%S.%f')
+        else:
+            q.itime = datetime.datetime.strptime(m.group(1), '%Y-%m-%dT%H:%M:%S')
+        return q
+
+    def process(self,q):
+        q.globaltime=fixtime(q.name,q.time)
+        q.uxtime=datetime.datetime.utcfromtimestamp(q.globaltime)
+
+        # correct for slot
+        q.itime+=datetime.timedelta(seconds=q.slot*(3 * float(8.28 + 0.1))/1000)
+
+        q.timediff=q.uxtime-q.itime # missing correction for sat travel time
+
+        return [[q.timediff.total_seconds(),q.itime]]
+
+    ini=None
+    fin=None
+    def consume(self,to):
+        if self.ini is None:
+            self.ini=to
+        self.fin=to
+
+    def end(self):
+        ppm=(self.fin[0]-self.ini[0])/(self.fin[1]-self.ini[1]).total_seconds()*1000000
+        print "rec.ppm %.3f"%(ppm)
+        gt=(self.fin[1]-self.ini[1]).total_seconds()
+
 class ReassembleIDA(Reassemble):
     def __init__(self):
         pass
@@ -109,13 +174,14 @@ class ReassembleIDA(Reassemble):
         q=super(ReassembleIDA,self).filter(line)
         if q==None: return None
         if q.typ=="IDA:":
+            q.time=fixtime(q.name,q.time)
             qqq=re.compile('.* CRC:OK')
             if not qqq.match(q.data):
                 return
             # 0010 0 ctr=000 000 len=02 0:0000 [06.3a]                                                       7456/0000 CRC:OK 0000
             # 0000 0 ctr=000 000 len=00 0:0000 [8a.ed.09.b2.e0.a9.e7.0b.06.78.c9.49.0d.9b.60.6f.c0.07.fc.00.00.00.00]  ---    0000
 
-            p=re.compile('.* cont=(\d) (\d) ctr=(\d+) \d+ len=(\d+) 0:0000 \[([0-9a-f.!]*)\]\s+..../.... CRC:OK')
+            p=re.compile('.* cont=(\d) (\d) ctr=(\d+) \d+ len=(\d+) 0:.000 \[([0-9a-f.!]*)\]\s+..../.... CRC:OK')
             m=p.match(q.data)
             if(not m):
                 print >> sys.stderr, "Couldn't parse IDA: ",q.data
@@ -161,7 +227,7 @@ class ReassembleIDA(Reassemble):
                     if verbose:
                         print ">assembled: [%s] %s"%(",".join(["%s"%x for x in time+[m.time]]),dat)
                     data="".join([chr(int(x,16)) for x in re.split("[.!]",dat)])
-                    return [[data,m.time,ul,m.level]]
+                    return [[data,m.time,ul,m.level,freq]]
                 self.stat_fragments+=1
                 ok=True
                 break
@@ -171,7 +237,7 @@ class ReassembleIDA(Reassemble):
             if verbose:
                 print ">single: [%s] %s"%(m.time,m.data)
             data="".join([chr(int(x,16)) for x in re.split("[.!]",m.data)])
-            return [[data,m.time,m.ul,m.level]]
+            return [[data,m.time,m.ul,m.level,m.frequency]]
         elif m.ctr==0 and m.cont: # New long packet
             self.stat_fragments+=1
             if verbose:
@@ -201,7 +267,7 @@ class ReassembleIDA(Reassemble):
         print "%d/%d (%3.1f%%) broken fragments."%(self.stat_broken,self.stat_fragments,(100.0*self.stat_broken/self.stat_fragments))
         print "%d dupes removed."%(self.stat_dupes)
     def consume(self,q):
-        (data,time,ul,level)=q
+        (data,time,ul,level,freq)=q
         if ul:
             ul="UL"
         else:
@@ -212,23 +278,13 @@ class ReassembleIDA(Reassemble):
                 str+=c
             else:
                 str+="."
-        print >>outfile, "%09d %s %s | %s"%(time,ul," ".join("%02x"%ord(x) for x in data),str)
+        print >>outfile, "%15.6f %s %s | %s"%(time,ul," ".join("%02x"%ord(x) for x in data),str)
 
 class ReassembleIDALAP(ReassembleIDA):
     first=True
-    outfile=None
-    def consume(self,q):
-        if self.first:
-            pcap_hdr=struct.pack("<LHHlLLL",0xa1b2c3d4,0x2,0x4,0x0,0,0xffff,1)
-            outfile.write(pcap_hdr)
-            self.first=False
-
-        # Filter non-GSM packets (see IDA-GSM.txt)
-        (data,time,ul,level)=q
-        if ord(data[0])&0xf==6 or ord(data[0])&0xf==8 or (ord(data[0])>>8)==7:
-            return
-        if len(data)==1:
-            return
+    sock = None
+    def gsmwrap(self,q):
+        (data,time,ul,level,freq)=q
         lapdm=data
         try:
             olvl=int(10*math.log(level,10))
@@ -239,12 +295,79 @@ class ReassembleIDALAP(ReassembleIDA):
         if olvl<-126:
             olvl=-126
 
+        # GSMTAP:
+        #
+        #struct gsmtap_hdr {
+        #        uint8_t version;        /* version, set to 0x01 currently */      2
+        #        uint8_t hdr_len;        /* length in number of 32bit words */     4
+        #        uint8_t type;           /* see GSMTAP_TYPE_* */                   2 (ABIS) / 0x13 (IRIDIUM)
+        #        uint8_t timeslot;       /* timeslot (0..7 on Um) */               0
+        #
+        #        uint16_t arfcn;         /* ARFCN (frequency) */                   0x0/0x4000
+        #        int8_t signal_dbm;      /* signal level in dBm */                 olvl
+        #        int8_t snr_db;          /* signal/noise ratio in dB */            0 ?
+        #        uint32_t frame_number;  /* GSM Frame Number (FN) */               freq??
+        #        uint8_t sub_type;       /* Type of burst/channel, see above */    7
+        #        uint8_t antenna_nr;     /* Antenna Number */                      0 ?
+        #        uint8_t sub_slot;       /* sub-slot within timeslot */            0 ?
+        #        uint8_t res;            /* reserved for future use (RFU) */       0 ?
+        #} +attribute+((packed));
         if ul:
-            gsm=struct.pack("!BBBBHbBLBBBB",2,4,1*0+2,0,0x4000,olvl,0,0,7,0,0,0)+lapdm
+            gsm=struct.pack("!BBBBHbBLBBBB",2,4,2,0,0x4000,olvl,0,freq,1,0,0,0)+lapdm
         else:
-            gsm=struct.pack("!BBBBHbBLBBBB",2,4,1*0+2,0,0x0000,olvl,0,0,7,0,0,0)+lapdm
+            gsm=struct.pack("!BBBBHbBLBBBB",2,4,2,0,0x0000,olvl,0,freq,1,0,0,0)+lapdm
 
-        udp=struct.pack("!HHHH",45988,4729,8+len(gsm),0xffff)+gsm
+        return gsm
+
+    def consume(self,q):
+        # Filter non-GSM packets (see IDA-GSM.txt)
+        if self.first:
+            self.sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            self.first=False
+
+        (data,_,ul,_,_)=q
+        if ord(data[0])&0xf==6 or ord(data[0])&0xf==8 or (ord(data[0])>>8)==7:
+            return
+        if len(data)==1:
+            return
+        pkt=self.gsmwrap(q)
+        self.sock.sendto(pkt, ("127.0.0.1", 4729)) # 4729 == GSMTAP
+
+        if verbose:
+            if ul:
+                ul="UL"
+            else:
+                ul="DL"
+            print "%15.6f %.3f %s %s"%(time,level,ul,".".join("%02x"%ord(x) for x in data))
+
+class ReassembleIDALAPPCAP(ReassembleIDALAP):
+    first=True
+    outfile=None
+    def consume(self,q):
+        # Most of this constructs fake ip packets around the gsmtap data so it can be written as pcap
+        if self.first:
+            #typedef struct pcap_hdr_s {
+            #        guint32 magic_number;   /* magic number */            0xa1b2c3d4
+            #        guint16 version_major;  /* major version number */    2
+            #        guint16 version_minor;  /* minor version number */    4
+            #        gint32  thiszone;       /* GMT to local correction */ 0
+            #        guint32 sigfigs;        /* accuracy of timestamps */  0
+            #        guint32 snaplen;        /* max length of captured packets, in octets */
+            #                                                              (must be > largest pkt)
+            #        guint32 network;        /* data link type */          1 (ethernet)
+            #} pcap_hdr_t;
+            pcap_hdr=struct.pack("<LHHlLLL",0xa1b2c3d4,0x2,0x4,0x0,0,0xffff,1)
+            outfile.write(pcap_hdr)
+            self.first=False
+
+        # Filter non-GSM packets (see IDA-GSM.txt)
+        (data,time,ul,_,_)=q
+        if ord(data[0])&0xf==6 or ord(data[0])&0xf==8 or (ord(data[0])>>8)==7:
+            return
+        if len(data)==1:
+            return
+        gsm=self.gsmwrap(q)
+        udp=struct.pack("!HHHH",45988,4729,8+len(gsm),0xffff)+gsm  # 4729 == GSMTAP
 
         if ul:
             ip=struct.pack("!BBHHBBBBHBBBBBBBB",(0x4<<4)+5,0,len(udp)+20,0xdaae,0x40,0x0,0x40,17,0xffff,10,0,0,1,127,0,0,1)+udp
@@ -256,15 +379,8 @@ class ReassembleIDALAP(ReassembleIDA):
         else:
             eth=struct.pack("!BBBBBBBBBBBBH",0x10,0x22,0x33,0x44,0x55,0x66,0xaa,0xbb,0xcc,0xdd,0xee,0xff,0x800)+ip
 
-        pcap=struct.pack("<IIII",time/1000,1000*(time%1000),len(eth),len(eth))+eth
+        pcap=struct.pack("<IIII",time,1000000*(time%1),len(eth),len(eth))+eth
         outfile.write(pcap)
-        if verbose:
-            if ul:
-                ul="UL"
-            else:
-                ul="DL"
-            print "%09d %.3f %s %s"%(time,level,ul,".".join("%02x"%ord(x) for x in data))
-
 
 class ReassembleIRA(Reassemble):
     def __init__(self):
@@ -280,15 +396,15 @@ class ReassembleIRA(Reassemble):
             else:
                 q.sat=  int(m.group(1))
                 q.beam= int(m.group(2))
-                q.posx= m.group(3)
-                q.posy= m.group(4)
+                q.lat=float(m.group(3))
+                q.lon=float(m.group(4))
                 q.alt=  int(m.group(5))
                 p=re.compile('PAGE\(tmsi:([0-9a-f]+) msc_id:([0-9]+)\)')
                 q.pages=p.findall(m.group(6))
                 return q
     def process(self,q):
         for x in q.pages:
-            return ["%02d %02d %s %s %03d : %s %s"%(q.sat,q.beam,q.posx,q.posy,q.alt,x[0],x[1])]
+            return ["%02d %02d %s %s %03d : %s %s"%(q.sat,q.beam,q.lat,q.lon,q.alt,x[0],x[1])]
     def consume(self,q):
         print >> outfile, q
 
@@ -390,14 +506,18 @@ if False:
     pass
 if mode == "ida":
     zx=ReassembleIDA()
+if mode == "gsmtap":
+    zx=ReassembleIDALAP()
 elif mode == "lap":
     if outfile == sys.stdout: # Force file, since it's binary
         ofile="%s.%s" % (basename, "pcap")
         outfile=open(ofile,"w")
-    zx=ReassembleIDALAP()
+    zx=ReassembleIDALAPPCAP()
 elif mode == "page":
     zx=ReassembleIRA()
 elif mode == "msg":
     zx=ReassembleMSG()
+elif mode == "ppm":
+    zx=ReassemblePPM()
 
 zx.run(fileinput.input(ifile))
