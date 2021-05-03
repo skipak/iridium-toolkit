@@ -111,7 +111,7 @@ class MyObject(object):
             self.snr=None
             self.noise=None
             try:
-                self.level=math.log(self.signal,10)*20
+                self.level=math.log(float(self.level),10)*20
             except ValueError:
                 print >> sys.stderr, "Invalid signal level:",self.level
                 self.level=0
@@ -893,13 +893,12 @@ class ReassembleMSG(Reassemble):
 
 validargs=()
 zx=None
-if False:
-    pass
+
 if mode == "ida":
     zx=ReassembleIDA()
-if mode == "idapp":
+elif mode == "idapp":
     zx=ReassembleIDAPP()
-if mode == "gsmtap":
+elif mode == "gsmtap":
     zx=ReassembleIDALAP()
 elif mode == "lap":
     validargs=('all')
@@ -907,7 +906,7 @@ elif mode == "lap":
         ofile="%s.%s" % (basename, "pcap")
         outfile=open(ofile,"w")
     zx=ReassembleIDALAPPCAP()
-if mode == "sbd":
+elif mode == "sbd":
     zx=ReassembleIDASBD()
 elif mode == "page":
     zx=ReassembleIRA()
